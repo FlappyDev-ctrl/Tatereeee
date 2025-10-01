@@ -20,6 +20,7 @@ public:
 	vec2 m_aMousePos[NUM_DUMMIES];
 	vec2 m_aMousePosOnAction[NUM_DUMMIES];
 	vec2 m_aTargetPos[NUM_DUMMIES];
+	vec2 m_aLastMousePos[NUM_DUMMIES];
 
 	int m_aAmmoCount[NUM_WEAPONS];
 
@@ -53,5 +54,9 @@ private:
 	static void ConKeyInputSet(IConsole::IResult *pResult, void *pUserData);
 	static void ConKeyInputNextPrevWeapon(IConsole::IResult *pResult, void *pUserData);
 	void ApplyAvoidFreeze(int Dummy);
+	bool DetectFreezeAhead(const vec2 &Pos, float Direction, float Distance, float StepSize, float &ClosestEdge) const;
+	bool IsPlayerOnGround(const vec2 &Pos) const;
+	bool IsPlayerActive(int Dummy);
+	bool IsMouseMoved(int Dummy);
 };
 #endif

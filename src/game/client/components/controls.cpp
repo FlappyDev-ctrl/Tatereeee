@@ -1,6 +1,7 @@
 /* (c) Magnus Auvinen. See licence.txt in the root of the distribution for more information. */
 /* If you are missing that file, acquire a complete release at teeworlds.com.                */
 #include <base/math.h>
+#include <algorithm>
 
 #include <engine/client.h>
 #include <engine/shared/config.h>
@@ -19,29 +20,38 @@
 
 namespace
 {
-	bool IsFreezeTile(const CCollision *pCollision, int Index)
-	{
-		if(Index < 0 || !pCollision)
-			return false;
+        constexpr int DEFAULT_AVOID_DELAY_MS = 500;
+        constexpr int ACTIVE_CHECK_COOLDOWN_MS = 100;
+        constexpr float PLAYER_ON_GROUND_OFFSET = 16.0f;
+        constexpr float PLAYER_HALF_WIDTH = 16.0f;
+        constexpr float s_aVerticalOffsets[] = {-14.0f, 0.0f, 14.0f};
 
-		const auto IsFreezeIndex = [](int TileIndex) {
-			return TileIndex == TILE_FREEZE || TileIndex == TILE_DFREEZE || TileIndex == TILE_LFREEZE;
-		};
+        int64_t s_aLastAvoidTime[NUM_DUMMIES] = {0};
+        int64_t s_aLastActiveCheckTime[NUM_DUMMIES] = {0};
 
-		if(const CTile *pGameLayer = pCollision->GameLayer())
-		{
-			if(IsFreezeIndex(pGameLayer[Index].m_Index))
-				return true;
-		}
+        bool IsFreezeTile(const CCollision *pCollision, int Index)
+        {
+                if(Index < 0 || !pCollision)
+                        return false;
 
-		if(const CTile *pFrontLayer = pCollision->FrontLayer())
-		{
-			if(IsFreezeIndex(pFrontLayer[Index].m_Index))
-				return true;
-		}
+                const auto IsFreezeIndex = [](int TileIndex) {
+                        return TileIndex == TILE_FREEZE || TileIndex == TILE_DFREEZE || TileIndex == TILE_LFREEZE;
+                };
 
-		return false;
-	}
+                if(const CTile *pGameLayer = pCollision->GameLayer())
+                {
+                        if(IsFreezeIndex(pGameLayer[Index].m_Index))
+                                return true;
+                }
+
+                if(const CTile *pFrontLayer = pCollision->FrontLayer())
+                {
+                        if(IsFreezeIndex(pFrontLayer[Index].m_Index))
+                                return true;
+                }
+
+                return false;
+        }
 } // namespace
 
 CControls::CControls()
@@ -50,6 +60,7 @@ CControls::CControls()
 	mem_zero(m_aMousePos, sizeof(m_aMousePos));
 	mem_zero(m_aMousePosOnAction, sizeof(m_aMousePosOnAction));
 	mem_zero(m_aTargetPos, sizeof(m_aTargetPos));
+	mem_zero(m_aLastMousePos, sizeof(m_aLastMousePos));
 }
 
 void CControls::OnReset()
@@ -61,6 +72,9 @@ void CControls::OnReset()
 		AmmoCount = 0;
 
 	m_LastSendTime = 0;
+
+	mem_zero(s_aLastAvoidTime, sizeof(s_aLastAvoidTime));
+	mem_zero(s_aLastActiveCheckTime, sizeof(s_aLastActiveCheckTime));
 }
 
 void CControls::ResetInput(int Dummy)
@@ -376,69 +390,129 @@ void CControls::ApplyAvoidFreeze(int Dummy)
 	if(GameClient()->m_aLocalIds[Dummy] < 0 || !GameClient()->m_Snap.m_pLocalCharacter)
 		return;
 
-	CCollision *pCollision = Collision();
-	if(!pCollision)
+	if(!IsPlayerActive(Dummy))
+		return;
+
+	if(!Collision())
 		return;
 
 	const vec2 Pos = GameClient()->m_LocalCharacterPos;
+	if(!IsPlayerOnGround(Pos))
+		return;
+
+	const int64_t CurrentTime = time_get();
+	const int64_t MinAvoidDelay = time_freq() * DEFAULT_AVOID_DELAY_MS / 1000;
+	if(CurrentTime - s_aLastAvoidTime[Dummy] < MinAvoidDelay)
+		return;
+
 	const float Distance = std::clamp(static_cast<float>(g_Config.m_TcAvoidFreezeDistance), 16.0f, 320.0f);
 	const float StepSize = 16.0f;
-	static const float s_aVerticalOffsets[] = {-14.0f, 0.0f, 14.0f};
 
-        auto FreezeInDirection = [&](float Dir, float &ClosestEdge) {
-                ClosestEdge = Distance + StepSize;
-                bool Found = false;
+	float ClosestLeftEdge = Distance + StepSize;
+	float ClosestRightEdge = Distance + StepSize;
+	const bool FreezeLeft = DetectFreezeAhead(Pos, -1.0f, Distance, StepSize, ClosestLeftEdge);
+	const bool FreezeRight = DetectFreezeAhead(Pos, 1.0f, Distance, StepSize, ClosestRightEdge);
 
-                for(float Step = StepSize; Step <= Distance; Step += StepSize)
-                {
-                        for(float OffsetY : s_aVerticalOffsets)
-                        {
-                                vec2 CheckPos = Pos + vec2(Dir * Step, OffsetY);
-                                int Index = pCollision->GetPureMapIndex(CheckPos);
-                                if(!IsFreezeTile(pCollision, Index))
-                                        continue;
+	if(!FreezeLeft && !FreezeRight)
+		return;
 
-                                vec2 TileCenter = pCollision->GetPos(Index);
-                                const float EdgeDistance = maximum(0.0f, absolute(TileCenter.x - Pos.x) - 16.0f);
-                                ClosestEdge = minimum(ClosestEdge, EdgeDistance);
-                                Found = true;
-                        }
-                }
+	const float RetreatDistance = 20.0f;
+	const float BlockDistance = 40.0f;
 
-                return Found;
-        };
+	int &Direction = m_aInputData[Dummy].m_Direction;
+	const int OriginalDirection = Direction;
 
-        float ClosestLeftEdge = Distance + StepSize;
-        float ClosestRightEdge = Distance + StepSize;
-        const bool FreezeLeft = FreezeInDirection(-1.0f, ClosestLeftEdge);
-        const bool FreezeRight = FreezeInDirection(1.0f, ClosestRightEdge);
+	const bool CloseLeft = FreezeLeft && ClosestLeftEdge <= RetreatDistance;
+	const bool CloseRight = FreezeRight && ClosestRightEdge <= RetreatDistance;
 
-        if(!FreezeLeft && !FreezeRight)
-                return;
+	if(CloseLeft && CloseRight)
+	{
+		Direction = 0;
+	}
+	else if(CloseLeft && (!FreezeRight || ClosestLeftEdge <= ClosestRightEdge))
+	{
+		Direction = 1;
+	}
+	else if(CloseRight && (!FreezeLeft || ClosestRightEdge <= ClosestLeftEdge))
+	{
+		Direction = -1;
+	}
+	else
+	{
+		const bool MoveLeftHeld = m_aInputDirectionLeft[Dummy] != 0;
+		const bool MoveRightHeld = m_aInputDirectionRight[Dummy] != 0;
 
-        const float RetreatDistance = 20.0f;
-        const float BlockDistance = 40.0f;
-        const bool CloseLeft = FreezeLeft && ClosestLeftEdge <= RetreatDistance;
-        const bool CloseRight = FreezeRight && ClosestRightEdge <= RetreatDistance;
+		if(FreezeLeft && MoveLeftHeld && ClosestLeftEdge <= BlockDistance)
+			Direction = 0;
+		else if(FreezeRight && MoveRightHeld && ClosestRightEdge <= BlockDistance)
+			Direction = 0;
+	}
 
-        int &Direction = m_aInputData[Dummy].m_Direction;
+	if(Direction != OriginalDirection)
+		s_aLastAvoidTime[Dummy] = CurrentTime;
+}
 
-        if(CloseLeft && CloseRight)
-        {
-                Direction = 0;
-                return;
-        }
+bool CControls::DetectFreezeAhead(const vec2 &Pos, float Direction, float Distance, float StepSize, float &ClosestEdge) const
+{
+	ClosestEdge = Distance + StepSize;
+	bool Found = false;
 
-        if(CloseLeft)
-                Direction = 1;
-        else if(CloseRight)
-                Direction = -1;
+	const CCollision *pCollision = Collision();
+	if(!pCollision)
+		return false;
 
-        if(FreezeLeft && m_aInputDirectionLeft[Dummy] && ClosestLeftEdge <= BlockDistance && Direction < 0)
-                Direction = 0;
+	for(float Step = StepSize; Step <= Distance; Step += StepSize)
+	{
+		for(float OffsetY : s_aVerticalOffsets)
+		{
+			const vec2 CheckPos = Pos + vec2(Direction * Step, OffsetY);
+			const int Index = pCollision->GetPureMapIndex(CheckPos);
+			if(!IsFreezeTile(pCollision, Index))
+				continue;
 
-        if(FreezeRight && m_aInputDirectionRight[Dummy] && ClosestRightEdge <= BlockDistance && Direction > 0)
-                Direction = 0;
+			const vec2 TileCenter = pCollision->GetPos(Index);
+			const float EdgeDistance = maximum(0.0f, absolute(TileCenter.x - Pos.x) - PLAYER_HALF_WIDTH);
+			ClosestEdge = minimum(ClosestEdge, EdgeDistance);
+			Found = true;
+		}
+	}
+
+	return Found;
+}
+
+bool CControls::IsPlayerOnGround(const vec2 &Pos) const
+{
+	const CCollision *pCollision = Collision();
+	if(!pCollision)
+		return false;
+
+	const float GroundY = Pos.y + PLAYER_ON_GROUND_OFFSET;
+	return pCollision->CheckPoint(Pos.x - PLAYER_HALF_WIDTH, GroundY) ||
+	       pCollision->CheckPoint(Pos.x + PLAYER_HALF_WIDTH, GroundY) ||
+	       pCollision->CheckPoint(Pos.x, GroundY);
+}
+
+bool CControls::IsPlayerActive(int Dummy)
+{
+	const int64_t CurrentTime = time_get();
+	const int64_t ActiveCooldown = time_freq() * ACTIVE_CHECK_COOLDOWN_MS / 1000;
+	if(CurrentTime - s_aLastActiveCheckTime[Dummy] < ActiveCooldown)
+		return false;
+
+	s_aLastActiveCheckTime[Dummy] = CurrentTime;
+
+	const CNetObj_PlayerInput &Input = m_aInputData[Dummy];
+	const bool MovementActive = m_aInputDirectionLeft[Dummy] || m_aInputDirectionRight[Dummy] || Input.m_Jump || Input.m_Hook;
+	const bool MouseActive = IsMouseMoved(Dummy);
+
+	return MovementActive || MouseActive;
+}
+
+bool CControls::IsMouseMoved(int Dummy)
+{
+	const bool HasMoved = m_aMousePos[Dummy] != m_aLastMousePos[Dummy];
+	m_aLastMousePos[Dummy] = m_aMousePos[Dummy];
+	return HasMoved;
 }
 
 void CControls::OnRender()
