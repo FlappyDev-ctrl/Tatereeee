@@ -385,38 +385,60 @@ void CControls::ApplyAvoidFreeze(int Dummy)
 	const float StepSize = 16.0f;
 	static const float s_aVerticalOffsets[] = {-14.0f, 0.0f, 14.0f};
 
-	auto FreezeInDirection = [&](float Dir) {
-		for(float Step = StepSize; Step <= Distance; Step += StepSize)
-		{
-			for(float OffsetY : s_aVerticalOffsets)
-			{
-				vec2 CheckPos = Pos + vec2(Dir * Step, OffsetY);
-				int Index = pCollision->GetPureMapIndex(CheckPos);
-				if(!IsFreezeTile(pCollision, Index))
-					continue;
+        auto FreezeInDirection = [&](float Dir, float &ClosestEdge) {
+                ClosestEdge = Distance + StepSize;
+                bool Found = false;
 
-				vec2 TileCenter = pCollision->GetPos(Index);
-				if(distance(Pos, TileCenter) <= Distance + 16.0f)
-					return true;
-			}
-		}
-		return false;
-	};
+                for(float Step = StepSize; Step <= Distance; Step += StepSize)
+                {
+                        for(float OffsetY : s_aVerticalOffsets)
+                        {
+                                vec2 CheckPos = Pos + vec2(Dir * Step, OffsetY);
+                                int Index = pCollision->GetPureMapIndex(CheckPos);
+                                if(!IsFreezeTile(pCollision, Index))
+                                        continue;
 
-	const bool FreezeLeft = FreezeInDirection(-1.0f);
-	const bool FreezeRight = FreezeInDirection(1.0f);
+                                vec2 TileCenter = pCollision->GetPos(Index);
+                                const float EdgeDistance = maximum(0.0f, absolute(TileCenter.x - Pos.x) - 16.0f);
+                                ClosestEdge = minimum(ClosestEdge, EdgeDistance);
+                                Found = true;
+                        }
+                }
 
-	if(!FreezeLeft && !FreezeRight)
-		return;
+                return Found;
+        };
 
-	const float VelX = GameClient()->m_PredictedChar.m_Vel.x;
-	int &Direction = m_aInputData[Dummy].m_Direction;
+        float ClosestLeftEdge = Distance + StepSize;
+        float ClosestRightEdge = Distance + StepSize;
+        const bool FreezeLeft = FreezeInDirection(-1.0f, ClosestLeftEdge);
+        const bool FreezeRight = FreezeInDirection(1.0f, ClosestRightEdge);
 
-	if(FreezeLeft && (m_aInputDirectionLeft[Dummy] || VelX < -1.0f))
-		Direction = 1;
+        if(!FreezeLeft && !FreezeRight)
+                return;
 
-	if(FreezeRight && (m_aInputDirectionRight[Dummy] || VelX > 1.0f))
-		Direction = -1;
+        const float RetreatDistance = 20.0f;
+        const float BlockDistance = 40.0f;
+        const bool CloseLeft = FreezeLeft && ClosestLeftEdge <= RetreatDistance;
+        const bool CloseRight = FreezeRight && ClosestRightEdge <= RetreatDistance;
+
+        int &Direction = m_aInputData[Dummy].m_Direction;
+
+        if(CloseLeft && CloseRight)
+        {
+                Direction = 0;
+                return;
+        }
+
+        if(CloseLeft)
+                Direction = 1;
+        else if(CloseRight)
+                Direction = -1;
+
+        if(FreezeLeft && m_aInputDirectionLeft[Dummy] && ClosestLeftEdge <= BlockDistance && Direction < 0)
+                Direction = 0;
+
+        if(FreezeRight && m_aInputDirectionRight[Dummy] && ClosestRightEdge <= BlockDistance && Direction > 0)
+                Direction = 0;
 }
 
 void CControls::OnRender()
