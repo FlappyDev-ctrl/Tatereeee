@@ -527,6 +527,12 @@ void CMenus::RenderSettingsTClientSettngs(CUIRect MainView)
 	Column.HSplitTop(LineSize, &Button, &Column);
 	if(g_Config.m_TcPredMarginInFreeze)
 		Ui()->DoScrollbarOption(&g_Config.m_TcPredMarginInFreezeAmount, &g_Config.m_TcPredMarginInFreezeAmount, &Button, TCLocalize("Frozen Margin"), 0, 100, &CUi::ms_LinearScrollbarScale, 0, "ms");
+	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_TcAvoidFreeze, TCLocalize("Avoid freeze tiles automatically"), &g_Config.m_TcAvoidFreeze, &Column, LineSize);
+	Column.HSplitTop(LineSize, &Button, &Column);
+	if(g_Config.m_TcAvoidFreeze)
+		Ui()->DoScrollbarOption(&g_Config.m_TcAvoidFreezeDistance, &g_Config.m_TcAvoidFreezeDistance, &Button, TCLocalize("Avoid distance"), 16, 320);
+	else
+		Column.HSplitTop(LineSize, nullptr, &Column);
 	s_SectionBoxes.back().h = Column.y - s_SectionBoxes.back().y;
 
 	// ***** Improved Anti Ping ***** //
