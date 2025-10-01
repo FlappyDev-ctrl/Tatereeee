@@ -11,10 +11,38 @@
 #include <game/client/components/scoreboard.h>
 #include <game/client/gameclient.h>
 #include <game/collision.h>
+#include <game/mapitems.h>
 
 #include <base/vmath.h>
 
 #include "controls.h"
+
+namespace
+{
+	bool IsFreezeTile(const CCollision *pCollision, int Index)
+	{
+		if(Index < 0 || !pCollision)
+			return false;
+
+		const auto IsFreezeIndex = [](int TileIndex) {
+			return TileIndex == TILE_FREEZE || TileIndex == TILE_DFREEZE || TileIndex == TILE_LFREEZE;
+		};
+
+		if(const CTile *pGameLayer = pCollision->GameLayer())
+		{
+			if(IsFreezeIndex(pGameLayer[Index].m_Index))
+				return true;
+		}
+
+		if(const CTile *pFrontLayer = pCollision->FrontLayer())
+		{
+			if(IsFreezeIndex(pFrontLayer[Index].m_Index))
+				return true;
+		}
+
+		return false;
+	}
+} // namespace
 
 CControls::CControls()
 {
@@ -257,14 +285,16 @@ int CControls::SnapInput(int *pData)
 
 		// set direction
 		m_aInputData[g_Config.m_ClDummy].m_Direction = 0;
-		if(m_aInputDirectionLeft[g_Config.m_ClDummy] && !m_aInputDirectionRight[g_Config.m_ClDummy])
-			m_aInputData[g_Config.m_ClDummy].m_Direction = -1;
-		if(!m_aInputDirectionLeft[g_Config.m_ClDummy] && m_aInputDirectionRight[g_Config.m_ClDummy])
-			m_aInputData[g_Config.m_ClDummy].m_Direction = 1;
+                if(m_aInputDirectionLeft[g_Config.m_ClDummy] && !m_aInputDirectionRight[g_Config.m_ClDummy])
+                        m_aInputData[g_Config.m_ClDummy].m_Direction = -1;
+                if(!m_aInputDirectionLeft[g_Config.m_ClDummy] && m_aInputDirectionRight[g_Config.m_ClDummy])
+                        m_aInputData[g_Config.m_ClDummy].m_Direction = 1;
 
-		// dummy copy moves
-		if(g_Config.m_ClDummyCopyMoves)
-		{
+                ApplyAvoidFreeze(g_Config.m_ClDummy);
+
+                // dummy copy moves
+                if(g_Config.m_ClDummyCopyMoves)
+                {
 			CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
 			pDummyInput->m_Direction = m_aInputData[g_Config.m_ClDummy].m_Direction;
 			pDummyInput->m_Hook = m_aInputData[g_Config.m_ClDummy].m_Hook;
@@ -283,8 +313,8 @@ int CControls::SnapInput(int *pData)
 			m_aInputData[!g_Config.m_ClDummy] = *pDummyInput;
 		}
 
-		if(g_Config.m_ClDummyControl)
-		{
+                if(g_Config.m_ClDummyControl)
+                {
 			CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
 			pDummyInput->m_Jump = g_Config.m_ClDummyJump;
 
@@ -296,7 +326,7 @@ int CControls::SnapInput(int *pData)
 			pDummyInput->m_Hook = g_Config.m_ClDummyHook;
 		}
 
-		// stress testing
+                // stress testing
 #ifdef CONF_DEBUG
 		if(g_Config.m_DbgStress)
 		{
@@ -322,17 +352,71 @@ int CControls::SnapInput(int *pData)
 		Send = Send || m_aInputData[g_Config.m_ClDummy].m_PrevWeapon != m_aLastData[g_Config.m_ClDummy].m_PrevWeapon;
 		Send = Send || time_get() > m_LastSendTime + time_freq() / 25; // send at least 25 Hz
 		Send = Send || (GameClient()->m_Snap.m_pLocalCharacter && GameClient()->m_Snap.m_pLocalCharacter->m_Weapon == WEAPON_NINJA && (m_aInputData[g_Config.m_ClDummy].m_Direction || m_aInputData[g_Config.m_ClDummy].m_Jump || m_aInputData[g_Config.m_ClDummy].m_Hook));
-	}
+        }
 
-	// copy and return size
-	m_aLastData[g_Config.m_ClDummy] = m_aInputData[g_Config.m_ClDummy];
+        // copy and return size
+        m_aLastData[g_Config.m_ClDummy] = m_aInputData[g_Config.m_ClDummy];
 
-	if(!Send)
-		return 0;
+        if(!Send)
+                return 0;
 
-	m_LastSendTime = time_get();
-	mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
-	return sizeof(m_aInputData[0]);
+        m_LastSendTime = time_get();
+        mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
+        return sizeof(m_aInputData[0]);
+}
+
+void CControls::ApplyAvoidFreeze(int Dummy)
+{
+	if(!g_Config.m_TcAvoidFreeze || GameClient()->m_Snap.m_SpecInfo.m_Active)
+		return;
+
+	if(Dummy < 0 || Dummy >= NUM_DUMMIES)
+		return;
+
+	if(GameClient()->m_aLocalIds[Dummy] < 0 || !GameClient()->m_Snap.m_pLocalCharacter)
+		return;
+
+	CCollision *pCollision = Collision();
+	if(!pCollision)
+		return;
+
+	const vec2 Pos = GameClient()->m_LocalCharacterPos;
+	const float Distance = std::clamp(static_cast<float>(g_Config.m_TcAvoidFreezeDistance), 16.0f, 320.0f);
+	const float StepSize = 16.0f;
+	static const float s_aVerticalOffsets[] = {-14.0f, 0.0f, 14.0f};
+
+	auto FreezeInDirection = [&](float Dir) {
+		for(float Step = StepSize; Step <= Distance; Step += StepSize)
+		{
+			for(float OffsetY : s_aVerticalOffsets)
+			{
+				vec2 CheckPos = Pos + vec2(Dir * Step, OffsetY);
+				int Index = pCollision->GetPureMapIndex(CheckPos);
+				if(!IsFreezeTile(pCollision, Index))
+					continue;
+
+				vec2 TileCenter = pCollision->GetPos(Index);
+				if(distance(Pos, TileCenter) <= Distance + 16.0f)
+					return true;
+			}
+		}
+		return false;
+	};
+
+	const bool FreezeLeft = FreezeInDirection(-1.0f);
+	const bool FreezeRight = FreezeInDirection(1.0f);
+
+	if(!FreezeLeft && !FreezeRight)
+		return;
+
+	const float VelX = GameClient()->m_PredictedChar.m_Vel.x;
+	int &Direction = m_aInputData[Dummy].m_Direction;
+
+	if(FreezeLeft && (m_aInputDirectionLeft[Dummy] || VelX < -1.0f))
+		Direction = 1;
+
+	if(FreezeRight && (m_aInputDirectionRight[Dummy] || VelX > 1.0f))
+		Direction = -1;
 }
 
 void CControls::OnRender()
