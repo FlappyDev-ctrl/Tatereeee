@@ -2,6 +2,7 @@
 /* If you are missing that file, acquire a complete release at teeworlds.com.                */
 #include <base/math.h>
 #include <algorithm>
+#include <vector>
 
 #include <engine/client.h>
 #include <engine/shared/config.h>
@@ -22,11 +23,13 @@ namespace
 {
         constexpr int DEFAULT_AVOID_DELAY_MS = 500;
         constexpr int ACTIVE_CHECK_COOLDOWN_MS = 100;
+        constexpr int DEFAULT_AVOID_JUMP_DELAY_MS = 650;
         constexpr float PLAYER_ON_GROUND_OFFSET = 16.0f;
         constexpr float PLAYER_HALF_WIDTH = 16.0f;
         constexpr float s_aVerticalOffsets[] = {-14.0f, 0.0f, 14.0f};
 
         int64_t s_aLastAvoidTime[NUM_DUMMIES] = {0};
+        int64_t s_aLastAvoidJumpTime[NUM_DUMMIES] = {0};
         int64_t s_aLastActiveCheckTime[NUM_DUMMIES] = {0};
 
         bool IsFreezeTile(const CCollision *pCollision, int Index)
@@ -52,6 +55,48 @@ namespace
 
                 return false;
         }
+
+        vec2 ComputeFreezeRepulsion(const CCollision *pCollision, const vec2 &Pos, float Distance, float StepSize)
+        {
+                vec2 Repulsion(0.0f, 0.0f);
+                if(!pCollision)
+                        return Repulsion;
+
+                const float MaxDistanceSq = Distance * Distance + 1.0f;
+                std::vector<int> ProcessedTiles;
+                ProcessedTiles.reserve(64);
+
+                for(float OffsetX = -Distance; OffsetX <= Distance; OffsetX += StepSize)
+                {
+                        for(float OffsetY = -Distance; OffsetY <= Distance; OffsetY += StepSize)
+                        {
+                                if(OffsetX * OffsetX + OffsetY * OffsetY > MaxDistanceSq)
+                                        continue;
+
+                                const vec2 CheckPos = Pos + vec2(OffsetX, OffsetY);
+                                const int Index = pCollision->GetPureMapIndex(CheckPos);
+                                if(Index < 0 || !IsFreezeTile(pCollision, Index))
+                                        continue;
+
+                                if(std::find(ProcessedTiles.begin(), ProcessedTiles.end(), Index) != ProcessedTiles.end())
+                                        continue;
+                                ProcessedTiles.push_back(Index);
+
+                                const vec2 TileCenter = pCollision->GetPos(Index);
+                                vec2 Diff = Pos - TileCenter;
+                                const float Len = length(Diff);
+                                if(Len <= 0.01f)
+                                        continue;
+
+                                const float SafeLen = maximum(Len, StepSize);
+                                const float Weight = 1.0f / (SafeLen * SafeLen);
+                                Diff *= Weight;
+                                Repulsion += Diff;
+                        }
+                }
+
+                return Repulsion;
+        }
 } // namespace
 
 CControls::CControls()
@@ -73,8 +118,9 @@ void CControls::OnReset()
 
 	m_LastSendTime = 0;
 
-	mem_zero(s_aLastAvoidTime, sizeof(s_aLastAvoidTime));
-	mem_zero(s_aLastActiveCheckTime, sizeof(s_aLastActiveCheckTime));
+        mem_zero(s_aLastAvoidTime, sizeof(s_aLastAvoidTime));
+        mem_zero(s_aLastAvoidJumpTime, sizeof(s_aLastAvoidJumpTime));
+        mem_zero(s_aLastActiveCheckTime, sizeof(s_aLastActiveCheckTime));
 }
 
 void CControls::ResetInput(int Dummy)
@@ -393,63 +439,111 @@ void CControls::ApplyAvoidFreeze(int Dummy)
 	if(!IsPlayerActive(Dummy))
 		return;
 
-	if(!Collision())
-		return;
+        const CCollision *pCollision = Collision();
+        if(!pCollision)
+                return;
 
-	const vec2 Pos = GameClient()->m_LocalCharacterPos;
-	if(!IsPlayerOnGround(Pos))
-		return;
+        const vec2 Pos = GameClient()->m_LocalCharacterPos;
+        if(!IsPlayerOnGround(Pos))
+                return;
 
-	const int64_t CurrentTime = time_get();
-	const int64_t MinAvoidDelay = time_freq() * DEFAULT_AVOID_DELAY_MS / 1000;
-	if(CurrentTime - s_aLastAvoidTime[Dummy] < MinAvoidDelay)
-		return;
+        const int64_t CurrentTime = time_get();
+        const int64_t MinAvoidDelay = time_freq() * DEFAULT_AVOID_DELAY_MS / 1000;
+        if(CurrentTime - s_aLastAvoidTime[Dummy] < MinAvoidDelay)
+                return;
 
-	const float Distance = std::clamp(static_cast<float>(g_Config.m_TcAvoidFreezeDistance), 16.0f, 320.0f);
-	const float StepSize = 16.0f;
+        const float Distance = std::clamp(static_cast<float>(g_Config.m_TcAvoidFreezeDistance), 16.0f, 320.0f);
+        const float StepSize = 16.0f;
 
-	float ClosestLeftEdge = Distance + StepSize;
-	float ClosestRightEdge = Distance + StepSize;
-	const bool FreezeLeft = DetectFreezeAhead(Pos, -1.0f, Distance, StepSize, ClosestLeftEdge);
-	const bool FreezeRight = DetectFreezeAhead(Pos, 1.0f, Distance, StepSize, ClosestRightEdge);
+        float ClosestLeftEdge = Distance + StepSize;
+        float ClosestRightEdge = Distance + StepSize;
+        const bool FreezeLeft = DetectFreezeAhead(Pos, -1.0f, Distance, StepSize, ClosestLeftEdge);
+        const bool FreezeRight = DetectFreezeAhead(Pos, 1.0f, Distance, StepSize, ClosestRightEdge);
+        const vec2 Repulsion = ComputeFreezeRepulsion(pCollision, Pos, Distance, StepSize);
 
-	if(!FreezeLeft && !FreezeRight)
-		return;
+        const bool NearbyFreeze = FreezeLeft || FreezeRight || absolute(Repulsion.x) > 0.01f || absolute(Repulsion.y) > 0.01f;
+        if(!NearbyFreeze)
+                return;
 
-	const float RetreatDistance = 20.0f;
-	const float BlockDistance = 40.0f;
+        float ClosestBelowEdge = Distance + StepSize;
+        bool FreezeBelow = false;
+        const float HorizontalOffsets[] = {-PLAYER_HALF_WIDTH, 0.0f, PLAYER_HALF_WIDTH};
+        for(float Step = StepSize; Step <= Distance; Step += StepSize)
+        {
+                for(float OffsetX : HorizontalOffsets)
+                {
+                        const vec2 CheckPos = Pos + vec2(OffsetX, Step);
+                        const int Index = pCollision->GetPureMapIndex(CheckPos);
+                        if(!IsFreezeTile(pCollision, Index))
+                                continue;
 
-	int &Direction = m_aInputData[Dummy].m_Direction;
-	const int OriginalDirection = Direction;
+                        const vec2 TileCenter = pCollision->GetPos(Index);
+                        const float EdgeDistance = maximum(0.0f, absolute(TileCenter.y - Pos.y) - PLAYER_HALF_WIDTH);
+                        ClosestBelowEdge = minimum(ClosestBelowEdge, EdgeDistance);
+                        FreezeBelow = true;
+                }
+        }
 
-	const bool CloseLeft = FreezeLeft && ClosestLeftEdge <= RetreatDistance;
-	const bool CloseRight = FreezeRight && ClosestRightEdge <= RetreatDistance;
+        const float Strength = std::clamp(static_cast<float>(g_Config.m_TcAvoidFreezeStrength), 0.0f, 100.0f) / 100.0f;
+        const float RetreatDistance = 12.0f + Strength * 28.0f;
+        const float BlockDistance = RetreatDistance + 20.0f;
+        const float ForceThreshold = 0.05f + (1.0f - Strength) * 0.2f;
 
-	if(CloseLeft && CloseRight)
-	{
-		Direction = 0;
-	}
-	else if(CloseLeft && (!FreezeRight || ClosestLeftEdge <= ClosestRightEdge))
-	{
-		Direction = 1;
-	}
-	else if(CloseRight && (!FreezeLeft || ClosestRightEdge <= ClosestLeftEdge))
-	{
-		Direction = -1;
-	}
-	else
-	{
-		const bool MoveLeftHeld = m_aInputDirectionLeft[Dummy] != 0;
-		const bool MoveRightHeld = m_aInputDirectionRight[Dummy] != 0;
+        int &Direction = m_aInputData[Dummy].m_Direction;
+        int DesiredDirection = Direction;
 
-		if(FreezeLeft && MoveLeftHeld && ClosestLeftEdge <= BlockDistance)
-			Direction = 0;
-		else if(FreezeRight && MoveRightHeld && ClosestRightEdge <= BlockDistance)
-			Direction = 0;
-	}
+        if(FreezeLeft && FreezeRight && minimum(ClosestLeftEdge, ClosestRightEdge) <= RetreatDistance)
+        {
+                DesiredDirection = 0;
+        }
+        else if(FreezeLeft && ClosestLeftEdge <= RetreatDistance && (!FreezeRight || ClosestLeftEdge <= ClosestRightEdge))
+        {
+                DesiredDirection = 1;
+        }
+        else if(FreezeRight && ClosestRightEdge <= RetreatDistance && (!FreezeLeft || ClosestRightEdge <= ClosestLeftEdge))
+        {
+                DesiredDirection = -1;
+        }
+        else
+        {
+                const float HorizontalForce = Repulsion.x;
+                if(HorizontalForce <= -ForceThreshold)
+                        DesiredDirection = -1;
+                else if(HorizontalForce >= ForceThreshold)
+                        DesiredDirection = 1;
+                else
+                {
+                        const bool MoveLeftHeld = m_aInputDirectionLeft[Dummy] != 0;
+                        const bool MoveRightHeld = m_aInputDirectionRight[Dummy] != 0;
 
-	if(Direction != OriginalDirection)
-		s_aLastAvoidTime[Dummy] = CurrentTime;
+                        if(FreezeLeft && MoveLeftHeld && ClosestLeftEdge <= BlockDistance)
+                                DesiredDirection = 0;
+                        else if(FreezeRight && MoveRightHeld && ClosestRightEdge <= BlockDistance)
+                                DesiredDirection = 0;
+                }
+        }
+
+        bool Adjusted = false;
+        if(DesiredDirection != Direction)
+        {
+                Direction = DesiredDirection;
+                Adjusted = true;
+        }
+
+        bool TriggeredJump = false;
+        if(g_Config.m_TcAvoidFreezeAutoJump && FreezeBelow && ClosestBelowEdge <= RetreatDistance)
+        {
+                const int64_t MinJumpDelay = time_freq() * DEFAULT_AVOID_JUMP_DELAY_MS / 1000;
+                if(CurrentTime - s_aLastAvoidJumpTime[Dummy] >= MinJumpDelay && m_aInputData[Dummy].m_Jump == 0)
+                {
+                        m_aInputData[Dummy].m_Jump = 1;
+                        s_aLastAvoidJumpTime[Dummy] = CurrentTime;
+                        TriggeredJump = true;
+                }
+        }
+
+        if(Adjusted || TriggeredJump)
+                s_aLastAvoidTime[Dummy] = CurrentTime;
 }
 
 bool CControls::DetectFreezeAhead(const vec2 &Pos, float Direction, float Distance, float StepSize, float &ClosestEdge) const
